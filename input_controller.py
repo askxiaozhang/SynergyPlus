@@ -4,6 +4,7 @@ Input controller for mouse and keyboard control using pynput
 
 import platform
 import subprocess
+import threading
 from pynput import mouse, keyboard
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, Controller as KeyboardController
@@ -273,41 +274,74 @@ class InputListener:
     """Listener for mouse and keyboard input"""
     
     def __init__(self, on_mouse_move=None, on_mouse_click=None, 
-                 on_mouse_scroll=None, on_key_press=None, on_key_release=None):
+                 on_mouse_scroll=None, on_key_press=None, on_key_release=None,
+                 suppress=False):
         self.on_mouse_move = on_mouse_move
         self.on_mouse_click = on_mouse_click
         self.on_mouse_scroll = on_mouse_scroll
         self.on_key_press = on_key_press
         self.on_key_release = on_key_release
+        self.suppress = suppress
         
         self.mouse_listener = None
         self.keyboard_listener = None
+        self._lock = threading.Lock()
     
     def start(self):
         """Start listening for input events"""
+        with self._lock:
+            self._start_listeners()
+    
+    def _start_listeners(self):
+        """Internal: create and start listeners with current suppress setting"""
         # Mouse listener
         self.mouse_listener = mouse.Listener(
             on_move=self._handle_mouse_move,
             on_click=self._handle_mouse_click,
-            on_scroll=self._handle_mouse_scroll
+            on_scroll=self._handle_mouse_scroll,
+            suppress=self.suppress
         )
         
         # Keyboard listener
         self.keyboard_listener = keyboard.Listener(
             on_press=self._handle_key_press,
-            on_release=self._handle_key_release
+            on_release=self._handle_key_release,
+            suppress=self.suppress
         )
         
         self.mouse_listener.start()
         self.keyboard_listener.start()
-        logger.info("Input listener started")
+        logger.info(f"Input listener started (suppress={self.suppress})")
+    
+    def _stop_listeners(self):
+        """Internal: stop current listeners"""
+        if self.mouse_listener:
+            try:
+                self.mouse_listener.stop()
+            except:
+                pass
+            self.mouse_listener = None
+        if self.keyboard_listener:
+            try:
+                self.keyboard_listener.stop()
+            except:
+                pass
+            self.keyboard_listener = None
+    
+    def set_suppress(self, suppress: bool):
+        """Change suppress mode by restarting listeners"""
+        if suppress == self.suppress:
+            return
+        with self._lock:
+            self.suppress = suppress
+            self._stop_listeners()
+            self._start_listeners()
+            logger.info(f"Input listener suppress changed to {suppress}")
     
     def stop(self):
         """Stop listening for input events"""
-        if self.mouse_listener:
-            self.mouse_listener.stop()
-        if self.keyboard_listener:
-            self.keyboard_listener.stop()
+        with self._lock:
+            self._stop_listeners()
         logger.info("Input listener stopped")
     
     def _handle_mouse_move(self, x, y):

@@ -212,6 +212,9 @@ def start_receive_thread(server: ServerConnection):
                     state.log(f"Cursor returned from server (edge: {edge})")
                     with state.switching_lock:
                         state.active_screen = 'master'
+                    # Un-suppress local input
+                    if state.listener:
+                        state.listener.set_suppress(False)
                 
                 elif msg.type == MessageType.ACK:
                     pass  # heartbeat ack
@@ -257,6 +260,11 @@ def on_mouse_move(x, y):
                         state.ignore_next_move = True  # ignore the warp event
                         state.controller.move_mouse(state.edge_lock_x, state.edge_lock_y)
                         state.log(f"→ Switched to {sid}")
+                        # Suppress local input (run in bg to avoid blocking)
+                        threading.Thread(
+                            target=lambda: state.listener and state.listener.set_suppress(True),
+                            daemon=True
+                        ).start()
             else:
                 # Normal local movement, just track position
                 state.last_mouse_x = x
