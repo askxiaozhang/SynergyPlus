@@ -21,7 +21,7 @@ from protocol import (
     MouseScrollMessage, KeyPressMessage, KeyReleaseMessage, HeartbeatMessage,
     MessageType, EnterScreenMessage
 )
-from input_controller import InputListener, get_screen_size, is_at_edge
+from input_controller import InputListener, InputController, get_screen_size, is_at_edge
 
 # Configure logging
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
@@ -55,6 +55,7 @@ class ServerConnection:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(5.0)
             self.socket.connect((self.host, self.port))
+            self.socket.settimeout(None)
             self.connected = True
             logger.info(f"Connected to {self.host}:{self.port}")
             return True
@@ -77,7 +78,11 @@ class ServerConnection:
         """Send message to server"""
         if not self.connected or not self.socket:
             return False
-        return send_message(self.socket, message)
+        try:
+            return send_message(self.socket, message)
+        except Exception as e:
+            logger.error(f"Send error to {self.id}: {e}")
+            return False
     
     def __str__(self):
         return f"{self.host}:{self.port}"
@@ -97,8 +102,16 @@ class MasterState:
         self.active_screen = 'master'  # 'master' or server_id
         self.control_enabled = False
         self.listener = None
+        self.controller = InputController()  # for warping cursor back to edge
+        
+        # Delta tracking for remote mouse
         self.last_mouse_x = 0
         self.last_mouse_y = 0
+        self.remote_cursor_x = 0  # current cursor pos on remote screen
+        self.remote_cursor_y = 0
+        self.edge_lock_x = 0  # where to lock cursor on master edge
+        self.edge_lock_y = 0
+        self.switching_lock = threading.Lock()
     
     def log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -140,7 +153,6 @@ class MasterState:
             if edge == 'right':
                 # Server should be to the right of master
                 if s_layout['x'] >= master['x'] + master['w'] - 50:
-                    # Map cursor Y to server Y
                     rel_y = (cursor_y - master['y']) / master['h']
                     entry_y = int(rel_y * server.screen_h)
                     entry_y = max(0, min(server.screen_h - 1, entry_y))
@@ -174,7 +186,7 @@ state = MasterState()
 
 
 def start_receive_thread(server: ServerConnection):
-    """Start a thread to receive messages from a server (e.g. LEAVE_SCREEN)"""
+    """Start a thread to receive messages from a server (e.g. LEAVE_SCREEN, SCREEN_INFO)"""
     def receive_loop():
         try:
             while server.connected:
@@ -186,12 +198,22 @@ def start_receive_thread(server: ServerConnection):
                     server.screen_w = msg.data.get('width', 1920)
                     server.screen_h = msg.data.get('height', 1080)
                     state.log(f"Server {server.id} screen: {server.screen_w}x{server.screen_h}")
+                    # Update layout with actual screen size
+                    layout = state.get_layout()
+                    if server.id in layout.get('servers', {}):
+                        layout['servers'][server.id]['w'] = server.screen_w
+                        layout['servers'][server.id]['h'] = server.screen_h
+                        state.config.set('screen_layout', layout)
+                        state.config.save()
                 
                 elif msg.type == MessageType.LEAVE_SCREEN:
-                    # Server cursor hit an edge, return control to master
                     edge = msg.data.get('edge', '')
-                    state.log(f"Server {server.id} cursor left at edge: {edge}")
-                    state.active_screen = 'master'
+                    state.log(f"Cursor returned from server (edge: {edge})")
+                    with state.switching_lock:
+                        state.active_screen = 'master'
+                
+                elif msg.type == MessageType.ACK:
+                    pass  # heartbeat ack
         except Exception as e:
             if server.connected:
                 logger.error(f"Error receiving from {server.id}: {e}")
@@ -199,8 +221,9 @@ def start_receive_thread(server: ServerConnection):
             if server.connected:
                 server.disconnect()
                 state.log(f"Lost connection to {server.id}")
-                if state.active_screen == server.id:
-                    state.active_screen = 'master'
+                with state.switching_lock:
+                    if state.active_screen == server.id:
+                        state.active_screen = 'master'
     
     server.receive_thread = threading.Thread(target=receive_loop, daemon=True)
     server.receive_thread.start()
@@ -211,27 +234,55 @@ def on_mouse_move(x, y):
     if not state.control_enabled:
         return
     
-    state.last_mouse_x = x
-    state.last_mouse_y = y
-    
-    if state.active_screen == 'master':
-        # Check if cursor is at an edge
-        edge = is_at_edge(x, y, state.screen_w, state.screen_h)
-        if edge:
-            result = state.find_server_at_edge(edge, x, y)
-            if result:
-                sid, entry_x, entry_y = result
-                server = state.servers[sid]
-                # Send ENTER_SCREEN to server
-                enter_msg = EnterScreenMessage(entry_x, entry_y, edge)
-                if server.send(enter_msg):
-                    state.active_screen = sid
-                    state.log(f"Switched to server {sid} at ({entry_x}, {entry_y})")
-    else:
-        # Forward mouse to active server
-        server = state.servers.get(state.active_screen)
-        if server and server.connected:
-            server.send(MouseMoveMessage(x, y))
+    with state.switching_lock:
+        if state.active_screen == 'master':
+            # Check if cursor is at an edge
+            edge = is_at_edge(x, y, state.screen_w, state.screen_h)
+            if edge:
+                result = state.find_server_at_edge(edge, x, y)
+                if result:
+                    sid, entry_x, entry_y = result
+                    server = state.servers[sid]
+                    # Send ENTER_SCREEN to server
+                    enter_msg = EnterScreenMessage(entry_x, entry_y, edge)
+                    if server.send(enter_msg):
+                        state.active_screen = sid
+                        state.remote_cursor_x = entry_x
+                        state.remote_cursor_y = entry_y
+                        state.edge_lock_x = x
+                        state.edge_lock_y = y
+                        state.last_mouse_x = x
+                        state.last_mouse_y = y
+                        state.log(f"→ Switched to {sid}")
+            else:
+                # Normal local movement, just track position
+                state.last_mouse_x = x
+                state.last_mouse_y = y
+        else:
+            # Controlling remote server — compute deltas from edge lock position
+            dx = x - state.last_mouse_x
+            dy = y - state.last_mouse_y
+            
+            if dx == 0 and dy == 0:
+                return
+            
+            # Update remote cursor position
+            server = state.servers.get(state.active_screen)
+            if server and server.connected:
+                state.remote_cursor_x += dx
+                state.remote_cursor_y += dy
+                
+                # Clamp to server screen
+                state.remote_cursor_x = max(0, min(server.screen_w - 1, state.remote_cursor_x))
+                state.remote_cursor_y = max(0, min(server.screen_h - 1, state.remote_cursor_y))
+                
+                # Send absolute position to server
+                server.send(MouseMoveMessage(int(state.remote_cursor_x), int(state.remote_cursor_y)))
+            
+            # Warp master cursor back to edge lock point to keep generating deltas
+            state.last_mouse_x = state.edge_lock_x
+            state.last_mouse_y = state.edge_lock_y
+            state.controller.move_mouse(state.edge_lock_x, state.edge_lock_y)
 
 
 def on_mouse_click(button, pressed):
@@ -359,8 +410,9 @@ def disconnect_server():
     sid = data.get('id', '')
     
     if sid in state.servers:
-        if state.active_screen == sid:
-            state.active_screen = 'master'
+        with state.switching_lock:
+            if state.active_screen == sid:
+                state.active_screen = 'master'
         state.servers[sid].disconnect()
         del state.servers[sid]
         state.log(f"Disconnected from {sid}")
@@ -384,7 +436,7 @@ def enable_control():
         on_key_release=on_key_release
     )
     state.listener.start()
-    state.log("Control enabled — move mouse to screen edge to switch")
+    state.log(f"Control enabled (screen: {state.screen_w}x{state.screen_h})")
     return jsonify({'status': 'success'})
 
 
@@ -405,7 +457,6 @@ def disable_control():
 @app.route('/api/layout', methods=['GET'])
 def get_layout():
     layout = state.get_layout()
-    # Add actual server screen sizes
     for sid, server in state.servers.items():
         if sid in layout.get('servers', {}):
             layout['servers'][sid]['w'] = server.screen_w
@@ -429,6 +480,7 @@ def main():
     """Main entry point"""
     state.log(f"Master screen: {state.screen_w}x{state.screen_h}")
     print(f"Starting Master Web Interface on http://0.0.0.0:5001")
+    print(f"Detected screen size: {state.screen_w}x{state.screen_h}")
     app.run(host='0.0.0.0', port=5001, debug=False)
 
 

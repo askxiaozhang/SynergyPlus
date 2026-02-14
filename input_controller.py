@@ -180,42 +180,69 @@ def get_screen_size():
     Returns:
         (width, height) tuple
     """
+    import re
     system = platform.system()
-    try:
-        if system == 'Darwin':  # macOS
+    
+    if system == 'Darwin':  # macOS
+        # Method 1: Quartz (most reliable)
+        try:
+            from Quartz import CGDisplayBounds, CGMainDisplayID
+            main = CGMainDisplayID()
+            bounds = CGDisplayBounds(main)
+            w, h = int(bounds.size.width), int(bounds.size.height)
+            if w > 0 and h > 0:
+                logger.info(f"Screen size (Quartz): {w}x{h}")
+                return (w, h)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Quartz failed: {e}")
+        
+        # Method 2: AppKit
+        try:
+            from AppKit import NSScreen
+            frame = NSScreen.mainScreen().frame()
+            w, h = int(frame.size.width), int(frame.size.height)
+            if w > 0 and h > 0:
+                logger.info(f"Screen size (AppKit): {w}x{h}")
+                return (w, h)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"AppKit failed: {e}")
+        
+        # Method 3: system_profiler
+        try:
             output = subprocess.check_output(
                 ['system_profiler', 'SPDisplaysDataType'],
-                text=True
+                text=True, timeout=5
             )
-            for line in output.split('\n'):
-                if 'Resolution' in line:
-                    parts = line.strip().split()
-                    # Format: "Resolution: 1920 x 1080 ..."
-                    w = int(parts[1])
-                    h = int(parts[3])
-                    return (w, h)
-            # Fallback: use Quartz
-            try:
-                from Quartz import CGDisplayBounds, CGMainDisplayID
-                main = CGMainDisplayID()
-                bounds = CGDisplayBounds(main)
-                return (int(bounds.size.width), int(bounds.size.height))
-            except ImportError:
-                pass
-        elif system == 'Linux':
+            # Handle various formats: "Resolution: 1920 x 1080" or "3024 x 1964"
+            match = re.search(r'Resolution:\s*(\d+)\s*x\s*(\d+)', output)
+            if match:
+                w, h = int(match.group(1)), int(match.group(2))
+                logger.info(f"Screen size (system_profiler): {w}x{h}")
+                return (w, h)
+        except Exception as e:
+            logger.warning(f"system_profiler failed: {e}")
+    
+    elif system == 'Linux':
+        try:
             output = subprocess.check_output(
                 ['xrandr', '--current'],
-                text=True
+                text=True, timeout=5
             )
             for line in output.split('\n'):
                 if '*' in line:
                     parts = line.strip().split()
                     res = parts[0].split('x')
-                    return (int(res[0]), int(res[1]))
-    except Exception as e:
-        logger.error(f"Error getting screen size: {e}")
+                    w, h = int(res[0]), int(res[1])
+                    logger.info(f"Screen size (xrandr): {w}x{h}")
+                    return (w, h)
+        except Exception as e:
+            logger.warning(f"xrandr failed: {e}")
     
-    # Default fallback
+    logger.warning("Could not detect screen size, using default 1920x1080")
     return (1920, 1080)
 
 
