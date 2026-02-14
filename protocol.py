@@ -20,6 +20,10 @@ class MessageType(Enum):
     SCREEN_INFO = 'screen_info'
     ENTER_SCREEN = 'enter_screen'
     LEAVE_SCREEN = 'leave_screen'
+    CLIPBOARD_SYNC = 'clipboard_sync'
+    FILE_TRANSFER_START = 'file_transfer_start'
+    FILE_TRANSFER_CHUNK = 'file_transfer_chunk'
+    FILE_TRANSFER_END = 'file_transfer_end'
 
 
 class Message:
@@ -201,3 +205,50 @@ def send_message(sock, message: Message) -> bool:
     except Exception as e:
         print(f"Error sending message: {e}")
         return False
+
+
+class ClipboardSyncMessage(Message):
+    """Sync clipboard content between machines"""
+    
+    def __init__(self, content: str, content_type: str = 'text'):
+        """
+        Args:
+            content: clipboard text content
+            content_type: 'text' or 'file_ref'
+        """
+        super().__init__(MessageType.CLIPBOARD_SYNC, {
+            'content': content,
+            'content_type': content_type
+        })
+
+
+class FileTransferStartMessage(Message):
+    """Start a file transfer"""
+    
+    def __init__(self, filename: str, file_size: int, transfer_id: str):
+        super().__init__(MessageType.FILE_TRANSFER_START, {
+            'filename': filename,
+            'file_size': file_size,
+            'transfer_id': transfer_id
+        })
+
+
+class FileTransferChunkMessage(Message):
+    """Send a chunk of file data (base64 encoded)"""
+    
+    def __init__(self, transfer_id: str, chunk_index: int, data_b64: str):
+        super().__init__(MessageType.FILE_TRANSFER_CHUNK, {
+            'transfer_id': transfer_id,
+            'chunk_index': chunk_index,
+            'data': data_b64
+        })
+
+
+class FileTransferEndMessage(Message):
+    """Mark file transfer as complete"""
+    
+    def __init__(self, transfer_id: str, total_chunks: int):
+        super().__init__(MessageType.FILE_TRANSFER_END, {
+            'transfer_id': transfer_id,
+            'total_chunks': total_chunks
+        })

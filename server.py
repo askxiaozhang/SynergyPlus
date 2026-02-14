@@ -21,7 +21,11 @@ import ipaddress
 from config import DEFAULT_PORT, DEFAULT_HOST, LOG_FORMAT, LOG_LEVEL, get_server_config
 from protocol import (
     receive_message, send_message, MessageType, AckMessage,
-    ScreenInfoMessage, LeaveScreenMessage
+    ScreenInfoMessage, LeaveScreenMessage, ClipboardSyncMessage
+)
+from clipboard_sync import (
+    ClipboardMonitor, FileTransferManager,
+    get_clipboard_text, set_clipboard_text
 )
 from input_controller import InputController, get_screen_size, is_at_edge
 
@@ -42,6 +46,35 @@ class ServerState:
         self.config = get_server_config()
         self.client_address = None
         self.screen_w, self.screen_h = get_screen_size()
+        
+        # Clipboard sync
+        max_file_size = self.config.get('clipboard.max_file_size', 100 * 1024 * 1024)
+        self.file_manager = FileTransferManager(max_file_size=max_file_size)
+        self.clipboard_monitor = ClipboardMonitor(
+            on_text_change=self._on_clipboard_text_change,
+            on_file_change=self._on_clipboard_file_change
+        )
+        self.clipboard_monitor.start()
+    
+    def _on_clipboard_text_change(self, text: str):
+        """When local clipboard changes, send to master"""
+        if self.server and self.server.client_socket:
+            try:
+                msg = ClipboardSyncMessage(text, 'text')
+                send_message(self.server.client_socket, msg)
+                self.log(f"Clipboard sent to master ({len(text)} chars)")
+            except Exception as e:
+                logger.debug(f"Clipboard send error: {e}")
+    
+    def _on_clipboard_file_change(self, files: list):
+        """When files are copied to clipboard, transfer to master"""
+        if self.server and self.server.client_socket:
+            for filepath in files:
+                def send_func(msg):
+                    send_message(self.server.client_socket, msg)
+                success = self.file_manager.send_file(filepath, send_func)
+                if success:
+                    self.log(f"File sent to master: {os.path.basename(filepath)}")
 
     def log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -279,6 +312,27 @@ class Server:
             elif msg_type == MessageType.HEARTBEAT:
                 if self.client_socket:
                     send_message(self.client_socket, AckMessage())
+            
+            elif msg_type == MessageType.CLIPBOARD_SYNC:
+                # Master sent clipboard content, paste it locally
+                content = data.get('content', '')
+                content_type = data.get('content_type', 'text')
+                if content_type == 'text' and content:
+                    state.clipboard_monitor.skip_next_change()
+                    set_clipboard_text(content)
+                    state.log(f"Clipboard synced from master ({len(content)} chars)")
+            
+            elif msg_type == MessageType.FILE_TRANSFER_START:
+                state.file_manager.handle_transfer_start(data)
+                state.log(f"Receiving file: {data.get('filename', '?')}")
+            
+            elif msg_type == MessageType.FILE_TRANSFER_CHUNK:
+                state.file_manager.handle_transfer_chunk(data)
+            
+            elif msg_type == MessageType.FILE_TRANSFER_END:
+                saved = state.file_manager.handle_transfer_end(data)
+                if saved:
+                    state.log(f"File saved: {saved}")
             
         except Exception as e:
             logger.error(f"Error processing message: {e}")

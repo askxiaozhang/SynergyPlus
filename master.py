@@ -19,9 +19,13 @@ from config import DEFAULT_PORT, LOG_FORMAT, LOG_LEVEL, get_master_config
 from protocol import (
     send_message, receive_message, MouseMoveMessage, MouseClickMessage,
     MouseScrollMessage, KeyPressMessage, KeyReleaseMessage, HeartbeatMessage,
-    MessageType, EnterScreenMessage
+    MessageType, EnterScreenMessage, ClipboardSyncMessage
 )
 from input_controller import InputListener, InputController, get_screen_size, is_at_edge
+from clipboard_sync import (
+    ClipboardMonitor, FileTransferManager,
+    get_clipboard_text, set_clipboard_text
+)
 
 # Configure logging
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
@@ -113,6 +117,36 @@ class MasterState:
         self.edge_lock_y = 0
         self.switching_lock = threading.Lock()
         self.ignore_next_move = False  # flag to skip synthetic warp events
+        
+        # Clipboard sync
+        max_file_size = self.config.get('clipboard.max_file_size', 100 * 1024 * 1024)
+        self.file_manager = FileTransferManager(max_file_size=max_file_size)
+        self.clipboard_monitor = ClipboardMonitor(
+            on_text_change=self._on_clipboard_text_change,
+            on_file_change=self._on_clipboard_file_change
+        )
+        self.clipboard_monitor.start()
+    
+    def _on_clipboard_text_change(self, text: str):
+        """When local clipboard changes, send to all connected servers"""
+        for sid, server in self.servers.items():
+            if server.connected:
+                try:
+                    server.send(ClipboardSyncMessage(text, 'text'))
+                except Exception as e:
+                    logger.debug(f"Clipboard send error to {sid}: {e}")
+        self.log(f"Clipboard synced to servers ({len(text)} chars)")
+    
+    def _on_clipboard_file_change(self, files: list):
+        """When files are copied to clipboard, transfer to active server"""
+        for filepath in files:
+            for sid, server in self.servers.items():
+                if server.connected:
+                    def send_func(msg, s=server):
+                        s.send(msg)
+                    success = self.file_manager.send_file(filepath, send_func)
+                    if success:
+                        self.log(f"File sent to {sid}: {os.path.basename(filepath)}")
     
     def log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -218,6 +252,27 @@ def start_receive_thread(server: ServerConnection):
                 
                 elif msg.type == MessageType.ACK:
                     pass  # heartbeat ack
+                
+                elif msg.type == MessageType.CLIPBOARD_SYNC:
+                    # Server sent clipboard content, paste it locally
+                    content = msg.data.get('content', '')
+                    content_type = msg.data.get('content_type', 'text')
+                    if content_type == 'text' and content:
+                        state.clipboard_monitor.skip_next_change()
+                        set_clipboard_text(content)
+                        state.log(f"Clipboard synced from {server.id} ({len(content)} chars)")
+                
+                elif msg.type == MessageType.FILE_TRANSFER_START:
+                    state.file_manager.handle_transfer_start(msg.data)
+                    state.log(f"Receiving file from {server.id}: {msg.data.get('filename', '?')}")
+                
+                elif msg.type == MessageType.FILE_TRANSFER_CHUNK:
+                    state.file_manager.handle_transfer_chunk(msg.data)
+                
+                elif msg.type == MessageType.FILE_TRANSFER_END:
+                    saved = state.file_manager.handle_transfer_end(msg.data)
+                    if saved:
+                        state.log(f"File saved: {saved}")
         except Exception as e:
             if server.connected:
                 logger.error(f"Error receiving from {server.id}: {e}")

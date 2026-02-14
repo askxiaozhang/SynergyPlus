@@ -113,6 +113,10 @@ DEFAULT_MASTER_CONFIG = {
     "screen_layout": {
         "master": {"x": 0, "y": 0, "w": 1920, "h": 1080},
         "servers": {}
+    },
+    "clipboard": {
+        "enabled": True,
+        "max_file_size": 104857600  # 100MB
     }
 }
 
@@ -127,6 +131,10 @@ DEFAULT_SERVER_CONFIG = {
     "security": {
         "enable_whitelist": False,
         "whitelist": []
+    },
+    "clipboard": {
+        "enabled": True,
+        "max_file_size": 104857600  # 100MB
     }
 }
 
