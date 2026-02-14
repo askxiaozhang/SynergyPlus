@@ -109,7 +109,11 @@ DEFAULT_MASTER_CONFIG = {
         "last_active_server": "",
         "control_hotkey": "ctrl+shift+s"
     },
-    "servers": []
+    "servers": [],
+    "screen_layout": {
+        "master": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+        "servers": {}
+    }
 }
 
 DEFAULT_SERVER_CONFIG = {

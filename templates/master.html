@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SynergyPlus Master</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/master.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container master-container">
+        <header>
+            <h1>SynergyPlus Master</h1>
+            <div class="status-badge" id="control-badge">Disabled</div>
+        </header>
+
+        <main>
+            <!-- Screen Layout Editor -->
+            <section class="card layout-card">
+                <div class="card-header">
+                    <h2>Screen Layout</h2>
+                    <div class="button-group">
+                        <button class="btn btn-secondary btn-sm" onclick="resetLayout()">Reset</button>
+                        <button class="btn btn-primary btn-sm" onclick="saveLayout()">Save Layout</button>
+                    </div>
+                </div>
+                <div class="layout-canvas" id="layout-canvas">
+                    <!-- Screens will be rendered here dynamically -->
+                </div>
+                <div class="layout-hint">Drag server screens to position them around the master screen</div>
+            </section>
+
+            <!-- Add Server -->
+            <section class="card">
+                <h2>Add Server</h2>
+                <div class="connect-form">
+                    <div class="form-group inline">
+                        <label>Host</label>
+                        <input type="text" id="server-host" placeholder="192.168.1.100" value="127.0.0.1">
+                    </div>
+                    <div class="form-group inline narrow">
+                        <label>Port</label>
+                        <input type="number" id="server-port" value="9999">
+                    </div>
+                    <button class="btn btn-primary" onclick="connectServer()">Connect</button>
+                </div>
+            </section>
+
+            <!-- Connected Servers -->
+            <section class="card">
+                <h2>Connected Servers</h2>
+                <div class="server-list" id="server-list">
+                    <div class="empty-state">No servers connected</div>
+                </div>
+            </section>
+
+            <!-- Control -->
+            <section class="card">
+                <h2>Control</h2>
+                <div class="control-bar">
+                    <span class="control-status" id="control-status">
+                        Disabled — connect a server first
+                    </span>
+                    <button class="btn btn-primary" id="control-btn" onclick="toggleControl()" disabled>
+                        Enable Control
+                    </button>
+                </div>
+            </section>
+
+            <!-- Logs -->
+            <section class="card log-card">
+                <h2>Logs</h2>
+                <div class="log-container" id="log-container"></div>
+            </section>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/master.js') }}"></script>
+</body>
+
+</html>

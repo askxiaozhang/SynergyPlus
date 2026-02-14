@@ -2,12 +2,16 @@
 Input controller for mouse and keyboard control using pynput
 """
 
+import platform
+import subprocess
 from pynput import mouse, keyboard
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, Controller as KeyboardController
 import logging
 
 logger = logging.getLogger(__name__)
+
+EDGE_THRESHOLD = 2  # pixels from edge to trigger screen switch
 
 
 class InputController:
@@ -30,6 +34,24 @@ class InputController:
             logger.debug(f"Mouse moved to ({x}, {y})")
         except Exception as e:
             logger.error(f"Error moving mouse: {e}")
+    
+    def move_mouse_relative(self, dx: int, dy: int):
+        """
+        Move mouse by relative delta
+        
+        Args:
+            dx: horizontal delta
+            dy: vertical delta
+        """
+        try:
+            current_x, current_y = self.mouse.position
+            self.mouse.position = (current_x + dx, current_y + dy)
+        except Exception as e:
+            logger.error(f"Error moving mouse relative: {e}")
+    
+    def get_mouse_position(self):
+        """Get current mouse position"""
+        return self.mouse.position
     
     def click_mouse(self, button: str, pressed: bool):
         """
@@ -149,6 +171,75 @@ class InputController:
         else:
             # Regular character key
             return key_str if len(key_str) == 1 else key_str
+
+
+def get_screen_size():
+    """
+    Get the primary screen resolution.
+    
+    Returns:
+        (width, height) tuple
+    """
+    system = platform.system()
+    try:
+        if system == 'Darwin':  # macOS
+            output = subprocess.check_output(
+                ['system_profiler', 'SPDisplaysDataType'],
+                text=True
+            )
+            for line in output.split('\n'):
+                if 'Resolution' in line:
+                    parts = line.strip().split()
+                    # Format: "Resolution: 1920 x 1080 ..."
+                    w = int(parts[1])
+                    h = int(parts[3])
+                    return (w, h)
+            # Fallback: use Quartz
+            try:
+                from Quartz import CGDisplayBounds, CGMainDisplayID
+                main = CGMainDisplayID()
+                bounds = CGDisplayBounds(main)
+                return (int(bounds.size.width), int(bounds.size.height))
+            except ImportError:
+                pass
+        elif system == 'Linux':
+            output = subprocess.check_output(
+                ['xrandr', '--current'],
+                text=True
+            )
+            for line in output.split('\n'):
+                if '*' in line:
+                    parts = line.strip().split()
+                    res = parts[0].split('x')
+                    return (int(res[0]), int(res[1]))
+    except Exception as e:
+        logger.error(f"Error getting screen size: {e}")
+    
+    # Default fallback
+    return (1920, 1080)
+
+
+def is_at_edge(x, y, screen_w, screen_h, threshold=EDGE_THRESHOLD):
+    """
+    Check if cursor is at a screen edge.
+    
+    Args:
+        x, y: cursor position
+        screen_w, screen_h: screen dimensions
+        threshold: pixel distance from edge
+    
+    Returns:
+        'left', 'right', 'top', 'bottom', or None
+    """
+    if x <= threshold:
+        return 'left'
+    if x >= screen_w - threshold - 1:
+        return 'right'
+    if y <= threshold:
+        return 'top'
+    if y >= screen_h - threshold - 1:
+        return 'bottom'
+    return None
 
 
 class InputListener:

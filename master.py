@@ -2,28 +2,34 @@
 """
 SynergyPlus Master Application
 Controls remote servers by capturing and forwarding mouse/keyboard input
+Web Interface Version — Extended Display Mode
 """
 
 import os
 import socket
 import threading
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
 import logging
 import platform
+import time
 from datetime import datetime
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 
 from config import DEFAULT_PORT, LOG_FORMAT, LOG_LEVEL, get_master_config
 from protocol import (
     send_message, receive_message, MouseMoveMessage, MouseClickMessage,
-    MouseScrollMessage, KeyPressMessage, KeyReleaseMessage, HeartbeatMessage
+    MouseScrollMessage, KeyPressMessage, KeyReleaseMessage, HeartbeatMessage,
+    MessageType, EnterScreenMessage
 )
-from input_controller import InputListener
-from config_dialog import MasterConfigDialog
+from input_controller import InputListener, get_screen_size, is_at_edge
 
 # Configure logging
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
+
+# Flask App Setup
+app = Flask(__name__)
+CORS(app)
 
 
 class ServerConnection:
@@ -35,6 +41,13 @@ class ServerConnection:
         self.name = name if name else f"{host}:{port}"
         self.socket = None
         self.connected = False
+        self.screen_w = 1920
+        self.screen_h = 1080
+        self.receive_thread = None
+    
+    @property
+    def id(self):
+        return f"{self.host}:{self.port}"
     
     def connect(self) -> bool:
         """Connect to the server"""
@@ -52,12 +65,12 @@ class ServerConnection:
     
     def disconnect(self):
         """Disconnect from the server"""
+        self.connected = False
         if self.socket:
             try:
                 self.socket.close()
             except:
                 pass
-        self.connected = False
         logger.info(f"Disconnected from {self.host}:{self.port}")
     
     def send(self, message) -> bool:
@@ -70,405 +83,353 @@ class ServerConnection:
         return f"{self.host}:{self.port}"
 
 
-class MasterGUI:
-    """GUI for master application"""
+class MasterState:
+    """Global state for the master application"""
     
     def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("SynergyPlus Master")
-        self.root.geometry("600x550")
-        
-        # Fix macOS rendering: use 'clam' theme instead of broken 'aqua'
-        style = ttk.Style()
-        style.theme_use('clam')
-        
-        # Load configuration
         self.config = get_master_config()
+        self.servers = {}  # id -> ServerConnection
+        self.logs = []
+        self.log_lock = threading.Lock()
         
-        # Server list
-        self.servers = []
-        self.active_server = None
-        
-        # Control state
+        # Screen switching engine state
+        self.screen_w, self.screen_h = get_screen_size()
+        self.active_screen = 'master'  # 'master' or server_id
         self.control_enabled = False
         self.listener = None
-        
-        self._create_widgets()
-        self._load_saved_servers()
-        
-        # Force update to ensure widgets are rendered
-        self.root.update_idletasks()
-        
-        # Schedule window to come to front after mainloop starts
-        self.root.after(100, self._bring_to_front)
-    
-    def _create_widgets(self):
-        """Create GUI widgets"""
-        # Title
-        title_label = tk.Label(
-            self.root,
-            text="SynergyPlus Master",
-            font=("Arial", 18, "bold")
-        )
-        title_label.pack(pady=10)
-        
-        # Connection frame
-        conn_frame = ttk.LabelFrame(self.root, text="Add Server", padding=10)
-        conn_frame.pack(fill="x", padx=10, pady=5)
-        
-        ttk.Label(conn_frame, text="Host:").grid(row=0, column=0, sticky="w")
-        self.host_entry = ttk.Entry(conn_frame, width=20)
-        self.host_entry.insert(0, "127.0.0.1")
-        self.host_entry.grid(row=0, column=1, sticky="w", padx=5)
-        
-        ttk.Label(conn_frame, text="Port:").grid(row=0, column=2, sticky="w")
-        self.port_entry = ttk.Entry(conn_frame, width=10)
-        default_port = self.config.get('network.default_port', DEFAULT_PORT)
-        self.port_entry.insert(0, str(default_port))
-        self.port_entry.grid(row=0, column=3, sticky="w", padx=5)
-        
-        ttk.Button(
-            conn_frame,
-            text="Connect",
-            command=self.add_server
-        ).grid(row=0, column=4, padx=5)
-        
-        # Server list frame
-        server_frame = ttk.LabelFrame(self.root, text="Connected Servers", padding=10)
-        server_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        # Treeview for servers
-        self.server_tree = ttk.Treeview(
-            server_frame,
-            columns=("Host", "Port", "Status"),
-            show="headings",
-            height=6,
-            selectmode="browse"
-        )
-        self.server_tree.heading("Host", text="Host")
-        self.server_tree.heading("Port", text="Port")
-        self.server_tree.heading("Status", text="Status")
-        
-        self.server_tree.column("Host", width=200)
-        self.server_tree.column("Port", width=100)
-        self.server_tree.column("Status", width=150)
-        
-        self.server_tree.pack(fill="both", expand=True)
-        
-        # Server control buttons
-        server_btn_frame = ttk.Frame(server_frame)
-        server_btn_frame.pack(fill="x", pady=5)
-        
-        ttk.Button(
-            server_btn_frame,
-            text="Set Active",
-            command=self.set_active_server
-        ).pack(side="left", padx=5)
-        
-        ttk.Button(
-            server_btn_frame,
-            text="Disconnect",
-            command=self.disconnect_server
-        ).pack(side="left", padx=5)
-        
-        ttk.Button(
-            server_btn_frame,
-            text="Settings",
-            command=self.open_settings
-        ).pack(side="right", padx=5)
-        
-        # Control frame
-        control_frame = ttk.LabelFrame(self.root, text="Control", padding=10)
-        control_frame.pack(fill="x", padx=10, pady=5)
-        
-        self.control_status_var = tk.StringVar(value="Disabled - No Active Server")
-        ttk.Label(control_frame, textvariable=self.control_status_var).pack(side="left")
-        
-        self.toggle_button = ttk.Button(
-            control_frame,
-            text="Enable Control",
-            command=self.toggle_control,
-            state="disabled"
-        )
-        self.toggle_button.pack(side="right", padx=5)
-        
-        # Log frame
-        log_frame = ttk.LabelFrame(self.root, text="Log", padding=10)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=6, state='disabled')
-        self.log_text.pack(fill="both", expand=True)
-        
-        # Bottom buttons
-        bottom_frame = ttk.Frame(self.root)
-        bottom_frame.pack(fill="x", padx=10, pady=10)
-        
-        ttk.Button(
-            bottom_frame,
-            text="Exit",
-            command=self.exit_app
-        ).pack(side="right")
+        self.last_mouse_x = 0
+        self.last_mouse_y = 0
     
     def log(self, message: str):
-        """Add message to log"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.config(state='normal')
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
+        entry = f"[{timestamp}] {message}"
+        with self.log_lock:
+            self.logs.append(entry)
+            if len(self.logs) > 1000:
+                self.logs.pop(0)
     
-    def add_server(self):
-        """Add a new server connection"""
-        host = self.host_entry.get().strip()
-        port_str = self.port_entry.get().strip()
+    def get_layout(self):
+        """Get screen layout from config"""
+        layout = self.config.get('screen_layout', {})
+        if not layout:
+            layout = {
+                'master': {'x': 0, 'y': 0, 'w': self.screen_w, 'h': self.screen_h},
+                'servers': {}
+            }
+        # Always update master screen size
+        layout['master'] = {'x': layout.get('master', {}).get('x', 0),
+                           'y': layout.get('master', {}).get('y', 0),
+                           'w': self.screen_w, 'h': self.screen_h}
+        return layout
+    
+    def find_server_at_edge(self, edge, cursor_x, cursor_y):
+        """
+        Find which server screen is adjacent to the master at the given edge.
+        Returns (server_id, entry_x, entry_y) or None.
+        """
+        layout = self.get_layout()
+        master = layout['master']
+        servers_layout = layout.get('servers', {})
         
-        if not host or not port_str:
-            messagebox.showerror("Error", "Please enter host and port")
-            return
+        for sid, s_layout in servers_layout.items():
+            if sid not in self.servers or not self.servers[sid].connected:
+                continue
+            
+            server = self.servers[sid]
+            
+            if edge == 'right':
+                # Server should be to the right of master
+                if s_layout['x'] >= master['x'] + master['w'] - 50:
+                    # Map cursor Y to server Y
+                    rel_y = (cursor_y - master['y']) / master['h']
+                    entry_y = int(rel_y * server.screen_h)
+                    entry_y = max(0, min(server.screen_h - 1, entry_y))
+                    return (sid, 0, entry_y)
+            
+            elif edge == 'left':
+                if s_layout['x'] + s_layout['w'] <= master['x'] + 50:
+                    rel_y = (cursor_y - master['y']) / master['h']
+                    entry_y = int(rel_y * server.screen_h)
+                    entry_y = max(0, min(server.screen_h - 1, entry_y))
+                    return (sid, server.screen_w - 1, entry_y)
+            
+            elif edge == 'top':
+                if s_layout['y'] + s_layout['h'] <= master['y'] + 50:
+                    rel_x = (cursor_x - master['x']) / master['w']
+                    entry_x = int(rel_x * server.screen_w)
+                    entry_x = max(0, min(server.screen_w - 1, entry_x))
+                    return (sid, entry_x, server.screen_h - 1)
+            
+            elif edge == 'bottom':
+                if s_layout['y'] >= master['y'] + master['h'] - 50:
+                    rel_x = (cursor_x - master['x']) / master['w']
+                    entry_x = int(rel_x * server.screen_w)
+                    entry_x = max(0, min(server.screen_w - 1, entry_x))
+                    return (sid, entry_x, 0)
         
+        return None
+
+
+state = MasterState()
+
+
+def start_receive_thread(server: ServerConnection):
+    """Start a thread to receive messages from a server (e.g. LEAVE_SCREEN)"""
+    def receive_loop():
         try:
-            port = int(port_str)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid port number")
-            return
-        
-        # Check if already connected
-        for server in self.servers:
-            if server.host == host and server.port == port:
-                messagebox.showwarning("Warning", "Already connected to this server")
-                return
-        
-        # Create connection
-        self.log(f"Connecting to {host}:{port}...")
-        server = ServerConnection(host, port)
-        
-        if server.connect():
-            self.servers.append(server)
-            self._update_server_list()
-            self.log(f"Connected to {host}:{port}")
-            messagebox.showinfo("Success", f"Connected to {host}:{port}")
-        else:
-            self.log(f"Failed to connect to {host}:{port}")
-            messagebox.showerror("Error", f"Failed to connect to {host}:{port}")
+            while server.connected:
+                msg = receive_message(server.socket)
+                if not msg:
+                    break
+                
+                if msg.type == MessageType.SCREEN_INFO:
+                    server.screen_w = msg.data.get('width', 1920)
+                    server.screen_h = msg.data.get('height', 1080)
+                    state.log(f"Server {server.id} screen: {server.screen_w}x{server.screen_h}")
+                
+                elif msg.type == MessageType.LEAVE_SCREEN:
+                    # Server cursor hit an edge, return control to master
+                    edge = msg.data.get('edge', '')
+                    state.log(f"Server {server.id} cursor left at edge: {edge}")
+                    state.active_screen = 'master'
+        except Exception as e:
+            if server.connected:
+                logger.error(f"Error receiving from {server.id}: {e}")
+        finally:
+            if server.connected:
+                server.disconnect()
+                state.log(f"Lost connection to {server.id}")
+                if state.active_screen == server.id:
+                    state.active_screen = 'master'
     
-    def disconnect_server(self):
-        """Disconnect selected server"""
-        selection = self.server_tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a server")
-            return
+    server.receive_thread = threading.Thread(target=receive_loop, daemon=True)
+    server.receive_thread.start()
+
+
+def on_mouse_move(x, y):
+    """Handle mouse move from InputListener"""
+    if not state.control_enabled:
+        return
+    
+    state.last_mouse_x = x
+    state.last_mouse_y = y
+    
+    if state.active_screen == 'master':
+        # Check if cursor is at an edge
+        edge = is_at_edge(x, y, state.screen_w, state.screen_h)
+        if edge:
+            result = state.find_server_at_edge(edge, x, y)
+            if result:
+                sid, entry_x, entry_y = result
+                server = state.servers[sid]
+                # Send ENTER_SCREEN to server
+                enter_msg = EnterScreenMessage(entry_x, entry_y, edge)
+                if server.send(enter_msg):
+                    state.active_screen = sid
+                    state.log(f"Switched to server {sid} at ({entry_x}, {entry_y})")
+    else:
+        # Forward mouse to active server
+        server = state.servers.get(state.active_screen)
+        if server and server.connected:
+            server.send(MouseMoveMessage(x, y))
+
+
+def on_mouse_click(button, pressed):
+    """Handle mouse click from InputListener"""
+    if not state.control_enabled:
+        return
+    if state.active_screen != 'master':
+        server = state.servers.get(state.active_screen)
+        if server and server.connected:
+            server.send(MouseClickMessage(button, pressed))
+
+
+def on_mouse_scroll(dx, dy):
+    """Handle mouse scroll from InputListener"""
+    if not state.control_enabled:
+        return
+    if state.active_screen != 'master':
+        server = state.servers.get(state.active_screen)
+        if server and server.connected:
+            server.send(MouseScrollMessage(dx, dy))
+
+
+def on_key_press(key):
+    """Handle key press from InputListener"""
+    if not state.control_enabled:
+        return
+    if state.active_screen != 'master':
+        server = state.servers.get(state.active_screen)
+        if server and server.connected:
+            server.send(KeyPressMessage(key))
+
+
+def on_key_release(key):
+    """Handle key release from InputListener"""
+    if not state.control_enabled:
+        return
+    if state.active_screen != 'master':
+        server = state.servers.get(state.active_screen)
+        if server and server.connected:
+            server.send(KeyReleaseMessage(key))
+
+
+# ==================== Flask Routes ====================
+
+@app.route('/')
+def index():
+    return render_template('master.html')
+
+
+@app.route('/api/status')
+def get_status():
+    servers_info = []
+    for sid, server in state.servers.items():
+        servers_info.append({
+            'id': sid,
+            'host': server.host,
+            'port': server.port,
+            'connected': server.connected,
+            'screen_w': server.screen_w,
+            'screen_h': server.screen_h,
+            'is_active': state.active_screen == sid
+        })
+    
+    return jsonify({
+        'control_enabled': state.control_enabled,
+        'active_screen': state.active_screen,
+        'master_screen': {'w': state.screen_w, 'h': state.screen_h},
+        'servers': servers_info
+    })
+
+
+@app.route('/api/logs')
+def get_logs():
+    cursor = request.args.get('cursor', 0, type=int)
+    with state.log_lock:
+        if cursor < 0: cursor = 0
+        if cursor >= len(state.logs):
+            return jsonify({'logs': [], 'cursor': len(state.logs)})
+        new_logs = state.logs[cursor:]
+        return jsonify({'logs': new_logs, 'cursor': len(state.logs)})
+
+
+@app.route('/api/connect', methods=['POST'])
+def connect_server():
+    data = request.json
+    host = data.get('host', '').strip()
+    port = int(data.get('port', DEFAULT_PORT))
+    
+    if not host:
+        return jsonify({'status': 'error', 'message': 'Host is required'})
+    
+    sid = f"{host}:{port}"
+    if sid in state.servers and state.servers[sid].connected:
+        return jsonify({'status': 'error', 'message': 'Already connected'})
+    
+    server = ServerConnection(host, port)
+    state.log(f"Connecting to {host}:{port}...")
+    
+    if server.connect():
+        state.servers[sid] = server
+        start_receive_thread(server)
         
-        item = selection[0]
-        index = int(item[1:], 16) - 1
+        # Add default layout position (right of master)
+        layout = state.get_layout()
+        if sid not in layout.get('servers', {}):
+            layout.setdefault('servers', {})[sid] = {
+                'x': layout['master']['x'] + layout['master']['w'],
+                'y': layout['master']['y'],
+                'w': server.screen_w,
+                'h': server.screen_h
+            }
+            state.config.set('screen_layout', layout)
+            state.config.save()
         
-        if 0 <= index < len(self.servers):
-            server = self.servers[index]
-            
-            # Disable control if this is the active server
-            if self.active_server == server:
-                if self.control_enabled:
-                    self.toggle_control()
-                self.active_server = None
-                self.toggle_button.config(state="disabled")
-                self.control_status_var.set("Disabled - No Active Server")
-            
-            server.disconnect()
-            self.servers.remove(server)
-            self._update_server_list()
-            self.log(f"Disconnected from {server}")
+        state.log(f"Connected to {host}:{port}")
+        return jsonify({'status': 'success'})
+    else:
+        state.log(f"Failed to connect to {host}:{port}")
+        return jsonify({'status': 'error', 'message': f'Failed to connect to {host}:{port}'})
+
+
+@app.route('/api/disconnect', methods=['POST'])
+def disconnect_server():
+    data = request.json
+    sid = data.get('id', '')
     
-    def set_active_server(self):
-        """Set selected server as active"""
-        selection = self.server_tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a server")
-            return
-        
-        item = selection[0]
-        index = int(item[1:], 16) - 1
-        
-        if 0 <= index < len(self.servers):
-            # Disable control first if enabled
-            if self.control_enabled:
-                self.toggle_control()
-            
-            self.active_server = self.servers[index]
-            self.toggle_button.config(state="normal")
-            self.control_status_var.set(f"Disabled - Active: {self.active_server}")
-            self._update_server_list()
-            self.log(f"Active server set to {self.active_server}")
+    if sid in state.servers:
+        if state.active_screen == sid:
+            state.active_screen = 'master'
+        state.servers[sid].disconnect()
+        del state.servers[sid]
+        state.log(f"Disconnected from {sid}")
+        return jsonify({'status': 'success'})
     
-    def toggle_control(self):
-        """Toggle control on/off"""
-        if not self.active_server:
-            messagebox.showwarning("Warning", "No active server")
-            return
-        
-        if self.control_enabled:
-            # Disable control
-            self.control_enabled = False
-            if self.listener:
-                self.listener.stop()
-                self.listener = None
-            
-            self.toggle_button.config(text="Enable Control")
-            self.control_status_var.set(f"Disabled - Active: {self.active_server}")
-            self.log("Control disabled")
-        else:
-            # Enable control
-            self.control_enabled = True
-            self.listener = InputListener(
-                on_mouse_move=self._on_mouse_move,
-                on_mouse_click=self._on_mouse_click,
-                on_mouse_scroll=self._on_mouse_scroll,
-                on_key_press=self._on_key_press,
-                on_key_release=self._on_key_release
-            )
-            self.listener.start()
-            
-            self.toggle_button.config(text="Disable Control")
-            self.control_status_var.set(f"ENABLED - Controlling: {self.active_server}")
-            self.log(f"Control enabled for {self.active_server}")
+    return jsonify({'status': 'error', 'message': 'Server not found'})
+
+
+@app.route('/api/control/enable', methods=['POST'])
+def enable_control():
+    if state.control_enabled:
+        return jsonify({'status': 'error', 'message': 'Already enabled'})
     
-    def _update_server_list(self):
-        """Update the server list display"""
-        # Clear tree
-        for item in self.server_tree.get_children():
-            self.server_tree.delete(item)
-        
-        # Add servers
-        for server in self.servers:
-            status = "Active" if server == self.active_server else "Connected"
-            if not server.connected:
-                status = "Disconnected"
-            
-            self.server_tree.insert(
-                "",
-                "end",
-                values=(server.host, server.port, status)
-            )
+    state.control_enabled = True
+    state.active_screen = 'master'
+    state.listener = InputListener(
+        on_mouse_move=on_mouse_move,
+        on_mouse_click=on_mouse_click,
+        on_mouse_scroll=on_mouse_scroll,
+        on_key_press=on_key_press,
+        on_key_release=on_key_release
+    )
+    state.listener.start()
+    state.log("Control enabled — move mouse to screen edge to switch")
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/control/disable', methods=['POST'])
+def disable_control():
+    if not state.control_enabled:
+        return jsonify({'status': 'error', 'message': 'Already disabled'})
     
-    def _on_mouse_move(self, x, y):
-        """Handle mouse move event"""
-        if self.control_enabled and self.active_server:
-            msg = MouseMoveMessage(x, y)
-            self.active_server.send(msg)
-    
-    def _on_mouse_click(self, button, pressed):
-        """Handle mouse click event"""
-        if self.control_enabled and self.active_server:
-            msg = MouseClickMessage(button, pressed)
-            self.active_server.send(msg)
-    
-    def _on_mouse_scroll(self, dx, dy):
-        """Handle mouse scroll event"""
-        if self.control_enabled and self.active_server:
-            msg = MouseScrollMessage(dx, dy)
-            self.active_server.send(msg)
-    
-    def _on_key_press(self, key):
-        """Handle key press event"""
-        if self.control_enabled and self.active_server:
-            msg = KeyPressMessage(key)
-            self.active_server.send(msg)
-    
-    def _on_key_release(self, key):
-        """Handle key release event"""
-        if self.control_enabled and self.active_server:
-            msg = KeyReleaseMessage(key)
-            self.active_server.send(msg)
-    
-    def open_settings(self):
-        """Open settings dialog"""
-        MasterConfigDialog(self.root, self.config, on_save=self._on_config_saved)
-    
-    def _on_config_saved(self):
-        """Handle configuration saved"""
-        # Update port entry with new default
-        default_port = self.config.get('network.default_port', DEFAULT_PORT)
-        current_port = self.port_entry.get()
-        if current_port == str(DEFAULT_PORT):
-            self.port_entry.delete(0, tk.END)
-            self.port_entry.insert(0, str(default_port))
-        self.log("Configuration saved")
-    
-    def _load_saved_servers(self):
-        """Load saved servers from configuration"""
-        saved_servers = self.config.get('servers', [])
-        last_active = self.config.get('behavior.last_active_server', '')
-        
-        # Don't auto-connect, just add to list for manual connection
-        for server_info in saved_servers:
-            host = server_info.get('host')
-            port = server_info.get('port')
-            name = server_info.get('name', '')
-            if host and port:
-                # Just log that we have saved servers, don't auto-connect
-                self.log(f"Saved server available: {name or f'{host}:{port}'}")
-    
-    def _save_servers_to_config(self):
-        """Save current servers to configuration"""
-        servers_list = []
-        for server in self.servers:
-            servers_list.append({
-                'host': server.host,
-                'port': server.port,
-                'name': server.name
-            })
-        
-        self.config.set('servers', servers_list)
-        
-        # Save last active server
-        if self.active_server:
-            self.config.set('behavior.last_active_server', str(self.active_server))
-        
-        self.config.save()
-    
-    def exit_app(self):
-        """Exit the application"""
-        if self.control_enabled:
-            self.toggle_control()
-        
-        # Save configuration before exit
-        self._save_servers_to_config()
-        
-        for server in self.servers:
-            server.disconnect()
-        
-        self.root.quit()
-    
-    def _bring_to_front(self):
-        """Bring window to front on macOS"""
-        self.root.lift()
-        self.root.attributes('-topmost', True)
-        self.root.after(100, lambda: self.root.attributes('-topmost', False))
-        
-        if platform.system() == 'Darwin':
-            try:
-                import subprocess
-                subprocess.Popen([
-                    'osascript', '-e',
-                    'tell application "System Events" to set frontmost of '
-                    'the first process whose unix id is '
-                    + str(os.getpid()) + ' to true'
-                ])
-            except Exception:
-                pass
-    
-    def run(self):
-        """Run the GUI main loop"""
-        try:
-            self.root.update()
-        except:
-            pass
-        self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
-        self.root.mainloop()
+    state.control_enabled = False
+    state.active_screen = 'master'
+    if state.listener:
+        state.listener.stop()
+        state.listener = None
+    state.log("Control disabled")
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/layout', methods=['GET'])
+def get_layout():
+    layout = state.get_layout()
+    # Add actual server screen sizes
+    for sid, server in state.servers.items():
+        if sid in layout.get('servers', {}):
+            layout['servers'][sid]['w'] = server.screen_w
+            layout['servers'][sid]['h'] = server.screen_h
+    return jsonify(layout)
+
+
+@app.route('/api/layout', methods=['POST'])
+def save_layout():
+    data = request.json
+    try:
+        state.config.set('screen_layout', data)
+        state.config.save()
+        state.log("Screen layout saved")
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
 
 
 def main():
     """Main entry point"""
-    gui = MasterGUI()
-    gui.run()
+    state.log(f"Master screen: {state.screen_w}x{state.screen_h}")
+    print(f"Starting Master Web Interface on http://0.0.0.0:5001")
+    app.run(host='0.0.0.0', port=5001, debug=False)
 
 
 if __name__ == '__main__':

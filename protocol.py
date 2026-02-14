@@ -17,6 +17,9 @@ class MessageType(Enum):
     KEY_RELEASE = 'key_release'
     HEARTBEAT = 'heartbeat'
     ACK = 'ack'
+    SCREEN_INFO = 'screen_info'
+    ENTER_SCREEN = 'enter_screen'
+    LEAVE_SCREEN = 'leave_screen'
 
 
 class Message:
@@ -115,6 +118,39 @@ class AckMessage(Message):
     
     def __init__(self):
         super().__init__(MessageType.ACK)
+
+
+class ScreenInfoMessage(Message):
+    """Report screen resolution to master"""
+    
+    def __init__(self, width: int, height: int):
+        super().__init__(MessageType.SCREEN_INFO, {'width': width, 'height': height})
+
+
+class EnterScreenMessage(Message):
+    """Master tells server to place cursor at entry point"""
+    
+    def __init__(self, x: int, y: int, edge: str):
+        """
+        Args:
+            x: entry X coordinate on the server screen
+            y: entry Y coordinate on the server screen
+            edge: which edge the cursor entered from ('left', 'right', 'top', 'bottom')
+        """
+        super().__init__(MessageType.ENTER_SCREEN, {'x': x, 'y': y, 'edge': edge})
+
+
+class LeaveScreenMessage(Message):
+    """Server tells master cursor has left its screen edge"""
+    
+    def __init__(self, edge: str, x: int, y: int):
+        """
+        Args:
+            edge: which edge the cursor left from ('left', 'right', 'top', 'bottom')
+            x: cursor X when leaving
+            y: cursor Y when leaving
+        """
+        super().__init__(MessageType.LEAVE_SCREEN, {'edge': edge, 'x': x, 'y': y})
 
 
 def receive_message(sock) -> Optional[Message]:

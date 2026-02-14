@@ -2,7 +2,7 @@
 """
 SynergyPlus Server Application
 Listens for connections from master and executes mouse/keyboard commands
-Web Interface Version
+Web Interface Version — Extended Display Mode
 """
 
 import os
@@ -19,8 +19,11 @@ from flask_cors import CORS
 import ipaddress
 
 from config import DEFAULT_PORT, DEFAULT_HOST, LOG_FORMAT, LOG_LEVEL, get_server_config
-from protocol import receive_message, send_message, MessageType, AckMessage
-from input_controller import InputController
+from protocol import (
+    receive_message, send_message, MessageType, AckMessage,
+    ScreenInfoMessage, LeaveScreenMessage
+)
+from input_controller import InputController, get_screen_size, is_at_edge
 
 # Configure logging
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
@@ -38,20 +41,21 @@ class ServerState:
         self.log_lock = threading.Lock()
         self.config = get_server_config()
         self.client_address = None
+        self.screen_w, self.screen_h = get_screen_size()
 
     def log(self, message: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {message}"
         with self.log_lock:
             self.logs.append(entry)
-            # Keep logs valid size
             if len(self.logs) > 1000:
                 self.logs.pop(0)
 
 state = ServerState()
 
+
 class Server:
-    """Server for receiving and executing commands"""
+    """Server for receiving and executing commands — Extended Display Mode"""
     
     def __init__(self, port: int, config):
         self.port = port
@@ -61,8 +65,11 @@ class Server:
         self.server_socket = None
         self.client_socket = None
         self.running = False
+        self.active = False  # True when this screen is being controlled
         self.accept_thread = None
         self.handle_thread = None
+        self.edge_thread = None
+        self.last_mouse_pos = None
     
     def start(self):
         """Start the server"""
@@ -73,6 +80,7 @@ class Server:
     def stop(self):
         """Stop the server"""
         self.running = False
+        self.active = False
         
         if self.client_socket:
             try:
@@ -125,6 +133,11 @@ class Server:
                     
                     self.client_socket = client_socket
                     
+                    # Send screen info to master
+                    screen_msg = ScreenInfoMessage(state.screen_w, state.screen_h)
+                    send_message(client_socket, screen_msg)
+                    state.log(f"Sent screen info: {state.screen_w}x{state.screen_h}")
+                    
                     # Handle client in a new thread
                     self.handle_thread = threading.Thread(
                         target=self._handle_client,
@@ -136,7 +149,6 @@ class Server:
                 except socket.timeout:
                     continue
                 except OSError:
-                    # Socket closed
                     break
                 except Exception as e:
                     if self.running:
@@ -146,7 +158,7 @@ class Server:
             logger.error(f"Error starting server socket: {e}")
             state.log(f"Error: {e}")
         finally:
-             state.log("Server socket closed")
+            state.log("Server socket closed")
 
     def _handle_client(self, client_socket, client_address):
         """Handle client connection"""
@@ -168,10 +180,36 @@ class Server:
             except:
                 pass
             
+            self.active = False
             if self.client_socket == client_socket:
                 self.client_socket = None
                 state.client_address = None
                 state.log(f"Client disconnected: {client_address[0]}:{client_address[1]}")
+    
+    def _start_edge_monitor(self):
+        """Monitor cursor position for edge detection while active"""
+        def monitor():
+            while self.active and self.running:
+                try:
+                    x, y = self.controller.get_mouse_position()
+                    edge = is_at_edge(x, y, state.screen_w, state.screen_h)
+                    
+                    if edge and self.client_socket:
+                        # Determine the opposite edge to return to master
+                        # e.g. if cursor hits 'left' edge on server, it should return to master
+                        leave_msg = LeaveScreenMessage(edge, int(x), int(y))
+                        send_message(self.client_socket, leave_msg)
+                        self.active = False
+                        state.log(f"Cursor left at edge: {edge}")
+                        break
+                except Exception as e:
+                    logger.error(f"Edge monitor error: {e}")
+                    break
+                
+                time.sleep(0.01)  # 100Hz polling
+        
+        self.edge_thread = threading.Thread(target=monitor, daemon=True)
+        self.edge_thread.start()
     
     def _process_message(self, message):
         """Process received message"""
@@ -179,23 +217,36 @@ class Server:
             msg_type = message.type
             data = message.data
             
-            if msg_type == MessageType.MOUSE_MOVE:
-                self.controller.move_mouse(data['x'], data['y'])
+            if msg_type == MessageType.ENTER_SCREEN:
+                # Master is sending control to us
+                entry_x = data.get('x', state.screen_w // 2)
+                entry_y = data.get('y', state.screen_h // 2)
+                self.controller.move_mouse(entry_x, entry_y)
+                self.active = True
+                state.log(f"Screen entered at ({entry_x}, {entry_y})")
+                self._start_edge_monitor()
+            
+            elif msg_type == MessageType.MOUSE_MOVE:
+                if self.active:
+                    self.controller.move_mouse(data['x'], data['y'])
             
             elif msg_type == MessageType.MOUSE_CLICK:
-                self.controller.click_mouse(data['button'], data['pressed'])
+                if self.active:
+                    self.controller.click_mouse(data['button'], data['pressed'])
             
             elif msg_type == MessageType.MOUSE_SCROLL:
-                self.controller.scroll_mouse(data['dx'], data['dy'])
+                if self.active:
+                    self.controller.scroll_mouse(data['dx'], data['dy'])
             
             elif msg_type == MessageType.KEY_PRESS:
-                self.controller.press_key(data['key'])
+                if self.active:
+                    self.controller.press_key(data['key'])
             
             elif msg_type == MessageType.KEY_RELEASE:
-                self.controller.release_key(data['key'])
+                if self.active:
+                    self.controller.release_key(data['key'])
             
             elif msg_type == MessageType.HEARTBEAT:
-                # Respond to heartbeat
                 if self.client_socket:
                     send_message(self.client_socket, AckMessage())
             
@@ -204,7 +255,6 @@ class Server:
     
     def _is_allowed_ip(self, client_ip: str) -> bool:
         """Check if client IP is allowed based on whitelist"""
-        # If whitelist is disabled, allow all
         if not self.config.get('security.enable_whitelist', False):
             return True
         
@@ -217,12 +267,10 @@ class Server:
             
             for allowed in whitelist:
                 try:
-                    # Check if it's a network (CIDR notation)
                     if '/' in allowed:
                         network = ipaddress.ip_network(allowed, strict=False)
                         if client_addr in network:
                             return True
-                    # Check if it's a single IP
                     else:
                         if client_addr == ipaddress.ip_address(allowed):
                             return True
@@ -246,12 +294,15 @@ def index():
 def get_status():
     running = state.server is not None and state.server.running
     port = state.config.get('network.port', DEFAULT_PORT)
+    active = state.server.active if state.server else False
     
     return jsonify({
         'running': running,
+        'active': active,
         'client_connected': state.client_address is not None,
         'client_address': state.client_address,
-        'port': port
+        'port': port,
+        'screen': {'w': state.screen_w, 'h': state.screen_h}
     })
 
 @app.route('/api/logs')
@@ -261,12 +312,8 @@ def get_logs():
         if cursor < 0: cursor = 0
         if cursor >= len(state.logs):
             return jsonify({'logs': [], 'cursor': len(state.logs)})
-            
         new_logs = state.logs[cursor:]
-        return jsonify({
-            'logs': new_logs,
-            'cursor': len(state.logs)
-        })
+        return jsonify({'logs': new_logs, 'cursor': len(state.logs)})
 
 @app.route('/api/start', methods=['POST'])
 def start_server():
@@ -306,7 +353,6 @@ def update_config():
         
         if port:
             state.config.set('network.port', int(port))
-        
         if whitelist is not None:
             state.config.set('security.whitelist', whitelist)
             state.config.set('security.enable_whitelist', len(whitelist) > 0)
@@ -319,7 +365,6 @@ def update_config():
 
 def main():
     """Main entry point"""
-    # Auto-start logic
     if state.config.get('behavior.auto_start', False):
         try:
             port = state.config.get('network.port', DEFAULT_PORT)
@@ -329,7 +374,7 @@ def main():
         except Exception as e:
             state.log(f"Error auto-starting server: {e}")
             
-    print("Starting Web Interface on http://0.0.0.0:5000")
+    print("Starting Web Interface on http://0.0.0.0:5003")
     app.run(host='0.0.0.0', port=5003, debug=False)
 
 if __name__ == '__main__':
