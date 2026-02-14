@@ -186,17 +186,34 @@ class Server:
                 state.client_address = None
                 state.log(f"Client disconnected: {client_address[0]}:{client_address[1]}")
     
-    def _start_edge_monitor(self):
-        """Monitor cursor position for edge detection while active"""
+    def _start_edge_monitor(self, entry_edge: str):
+        """Monitor cursor position for edge detection while active.
+        
+        Args:
+            entry_edge: the edge the cursor entered from — ignored until cursor moves away
+        """
         def monitor():
+            # Map entry edge to the OPPOSITE edge (that's where cursor appears)
+            # e.g. if master sent cursor to the right, cursor enters server from 'left'
+            opposite = {'left': 'left', 'right': 'right', 'top': 'top', 'bottom': 'bottom'}
+            suppress_edge = entry_edge  # Don't trigger on this edge initially
+            cleared = False  # Has cursor moved away from entry edge?
+            
             while self.active and self.running:
                 try:
                     x, y = self.controller.get_mouse_position()
                     edge = is_at_edge(x, y, state.screen_w, state.screen_h)
                     
+                    # Track when cursor moves away from the entry edge
+                    if not cleared:
+                        if edge != suppress_edge:
+                            cleared = True
+                        else:
+                            # Still at entry edge, skip
+                            time.sleep(0.01)
+                            continue
+                    
                     if edge and self.client_socket:
-                        # Determine the opposite edge to return to master
-                        # e.g. if cursor hits 'left' edge on server, it should return to master
                         leave_msg = LeaveScreenMessage(edge, int(x), int(y))
                         send_message(self.client_socket, leave_msg)
                         self.active = False
@@ -219,12 +236,25 @@ class Server:
             
             if msg_type == MessageType.ENTER_SCREEN:
                 # Master is sending control to us
+                entry_edge = data.get('edge', 'left')
                 entry_x = data.get('x', state.screen_w // 2)
                 entry_y = data.get('y', state.screen_h // 2)
+                
+                # Offset cursor 20px inside the screen so edge monitor doesn't trigger immediately
+                margin = 20
+                if entry_x <= margin:
+                    entry_x = margin
+                elif entry_x >= state.screen_w - margin:
+                    entry_x = state.screen_w - margin
+                if entry_y <= margin:
+                    entry_y = margin
+                elif entry_y >= state.screen_h - margin:
+                    entry_y = state.screen_h - margin
+                
                 self.controller.move_mouse(entry_x, entry_y)
                 self.active = True
-                state.log(f"Screen entered at ({entry_x}, {entry_y})")
-                self._start_edge_monitor()
+                state.log(f"Screen entered at ({entry_x}, {entry_y}) from edge: {entry_edge}")
+                self._start_edge_monitor(entry_edge)
             
             elif msg_type == MessageType.MOUSE_MOVE:
                 if self.active:
