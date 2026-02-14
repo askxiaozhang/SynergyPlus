@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SynergyPlus Server</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>SynergyPlus Server</h1>
+            <div class="status-badge" id="server-status-badge">Not Running</div>
+        </header>
+
+        <main>
+            <section class="card status-card">
+                <h2>Status</h2>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <span class="label">Server Status</span>
+                        <span class="value" id="server-status">Not Running</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="label">Client</span>
+                        <span class="value" id="client-info">None</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="label">Port</span>
+                        <span class="value" id="server-port">{{ port }}</span>
+                    </div>
+                     <div class="status-item">
+                        <span class="label">Host</span>
+                        <span class="value">{{ host }}</span>
+                    </div>
+                </div>
+            </section>
+
+            <section class="card controls-card">
+                <h2>Controls</h2>
+                <div class="button-group">
+                    <button id="start-btn" class="btn btn-primary" onclick="startServer()">Start Server</button>
+                    <button id="stop-btn" class="btn btn-danger" onclick="stopServer()" disabled>Stop Server</button>
+                </div>
+            </section>
+
+             <section class="card config-card">
+                <h2>Configuration</h2>
+                 <div class="form-group">
+                    <label for="config-port">Port</label>
+                    <input type="number" id="config-port" value="{{ port }}">
+                </div>
+                <div class="form-group">
+                    <label for="config-whitelist">Whitelist (IPs or CIDR, comma separated)</label>
+                    <input type="text" id="config-whitelist" placeholder="e.g. 192.168.1.100, 10.0.0.0/24">
+                </div>
+                 <div class="button-group">
+                    <button class="btn btn-secondary" onclick="saveConfig()">Save Configuration</button>
+                </div>
+            </section>
+
+            <section class="card log-card">
+                <h2>Logs</h2>
+                <div class="log-container" id="log-container">
+                    <!-- Logs will appear here -->
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
